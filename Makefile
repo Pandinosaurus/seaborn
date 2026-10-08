@@ -1,10 +1,16 @@
 export SHELL := /bin/bash
 
-test:
-	pytest -n auto --doctest-modules --cov=seaborn --cov-config=.coveragerc seaborn
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 
-unittests:
-	pytest -n auto --cov=seaborn --cov-config=.coveragerc seaborn
+test:
+	uv run --no-sync pytest -n auto --cov=seaborn --cov=tests --cov-config=pyproject.toml tests
 
 lint:
-	flake8 seaborn
+	uv run --no-sync ruff check seaborn/ tests/
+
+typecheck:
+	uv run --no-sync ty check
+
+docs:
+	uv run --no-sync make -C doc -j$(NPROC) notebooks
+	uv run --no-sync make -C doc SPHINXOPTS="-j$(NPROC)" html

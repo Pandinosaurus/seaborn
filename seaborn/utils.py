@@ -1,11 +1,11 @@
 """Utility functions, mostly for internal use."""
 import os
-import re
 import inspect
 import warnings
 import colorsys
+from contextlib import contextmanager
 from urllib.request import urlopen, urlretrieve
-from distutils.version import LooseVersion
+from types import ModuleType
 
 import numpy as np
 import pandas as pd
@@ -14,9 +14,15 @@ from matplotlib.colors import to_rgb
 import matplotlib.pyplot as plt
 from matplotlib.cbook import normalize_kwargs
 
+from seaborn._core.typing import deprecated
+from seaborn.external.version import Version
+from seaborn.external.appdirs import user_cache_dir
 
-__all__ = ["desaturate", "saturate", "set_hls_values",
+__all__ = ["desaturate", "saturate", "set_hls_values", "move_legend",
            "despine", "get_dataset_names", "get_data_home", "load_dataset"]
+
+DATASET_SOURCE = "https://raw.githubusercontent.com/mwaskom/seaborn-data/master"
+DATASET_NAMES_URL = f"{DATASET_SOURCE}/dataset_names.txt"
 
 
 def ci_to_errsize(cis, heights):
@@ -49,29 +55,6 @@ def ci_to_errsize(cis, heights):
     return errsize
 
 
-def _normal_quantile_func(q):
-    """
-    Compute the quantile function of the standard normal distribution.
-
-    This wrapper exists because we are dropping scipy as a mandatory dependency
-    but statistics.NormalDist was added to the standard library in 3.8.
-
-    """
-    try:
-        from statistics import NormalDist
-        qf = np.vectorize(NormalDist().inv_cdf)
-    except ImportError:
-        try:
-            from scipy.stats import norm
-            qf = norm.ppf
-        except ImportError:
-            msg = (
-                "Standard normal quantile functions require either Python>=3.8 or scipy"
-            )
-            raise RuntimeError(msg)
-    return qf(q)
-
-
 def _draw_figure(fig):
     """Force draw of a matplotlib figure, accounting for back-compat."""
     # See https://github.com/matplotlib/matplotlib/issues/19197 for context
@@ -83,8 +66,9 @@ def _draw_figure(fig):
             pass
 
 
-def _default_color(method, hue, color, kws):
+def _default_color(method, hue, color, kws, saturation=1):
     """If needed, get a default color by using the matplotlib property cycle."""
+
     if hue is not None:
         # This warning is probably user-friendly, but it's currently triggered
         # in a FacetGrid context and I don't want to mess with that logic right now
@@ -93,12 +77,18 @@ def _default_color(method, hue, color, kws):
         #      warnings.warn(msg)
         return None
 
+    kws = kws.copy()
+    kws.pop("label", None)
+
     if color is not None:
+        if saturation < 1:
+            color = desaturate(color, saturation)
         return color
 
     elif method.__name__ == "plot":
 
-        scout, = method([], [], **kws)
+        color = normalize_kwargs(kws, mpl.lines.Line2D).get("color")
+        scout, = method([], [], scalex=False, scaley=False, color=color)
         color = scout.get_color()
         scout.remove()
 
@@ -137,27 +127,19 @@ def _default_color(method, hue, color, kws):
         scout, = method([np.nan], [np.nan], **kws)
         color = to_rgb(scout.get_facecolor())
         scout.remove()
+        # Axes.bar adds both a patch and a container
+        method.__self__.containers.pop(-1)
 
     elif method.__name__ == "fill_between":
 
-        # There is a bug on matplotlib < 3.3 where fill_between with
-        # datetime units and empty data will set incorrect autoscale limits
-        # To workaround it, we'll always return the first color in the cycle.
-        # https://github.com/matplotlib/matplotlib/issues/17586
-        ax = method.__self__
-        datetime_axis = any([
-            isinstance(ax.xaxis.converter, mpl.dates.DateConverter),
-            isinstance(ax.yaxis.converter, mpl.dates.DateConverter),
-        ])
-        if LooseVersion(mpl.__version__) < "3.3" and datetime_axis:
-            return "C0"
-
-        kws = _normalize_kwargs(kws, mpl.collections.PolyCollection)
-
+        kws = normalize_kwargs(kws, mpl.collections.PolyCollection)
         scout = method([], [], **kws)
         facecolor = scout.get_facecolor()
         color = to_rgb(facecolor[0])
         scout.remove()
+
+    if saturation < 1:
+        color = desaturate(color, saturation)
 
     return color
 
@@ -184,6 +166,10 @@ def desaturate(color, prop):
 
     # Get rgb tuple rep
     rgb = to_rgb(color)
+
+    # Short circuit to avoid floating point issues
+    if prop == 1:
+        return rgb
 
     # Convert to hls
     h, l, s = colorsys.rgb_to_hls(*rgb)
@@ -390,6 +376,105 @@ def despine(fig=None, ax=None, top=True, right=True, left=False,
                 ax_i.set_yticks(newticks)
 
 
+def move_legend(obj, loc, **kwargs):
+    """
+    Recreate a plot's legend at a new location.
+
+    The name is a slight misnomer. Matplotlib legends do not expose public
+    control over their position parameters. So this function creates a new legend,
+    copying over the data from the original object, which is then removed.
+
+    Parameters
+    ----------
+    obj : the object with the plot
+        This argument can be either a seaborn or matplotlib object:
+
+        - :class:`seaborn.FacetGrid` or :class:`seaborn.PairGrid`
+        - :class:`matplotlib.axes.Axes` or :class:`matplotlib.figure.Figure`
+
+    loc : str or int
+        Location argument, as in :meth:`matplotlib.axes.Axes.legend`.
+
+    kwargs
+        Other keyword arguments are passed to :meth:`matplotlib.axes.Axes.legend`.
+
+    Examples
+    --------
+
+    .. include:: ../docstrings/move_legend.rst
+
+    """
+    # This is a somewhat hackish solution that will hopefully be obviated by
+    # upstream improvements to matplotlib legends that make them easier to
+    # modify after creation.
+
+    from seaborn.axisgrid import Grid  # Avoid circular import
+
+    # Locate the legend object and a method to recreate the legend
+    if isinstance(obj, Grid):
+        old_legend = obj.legend
+        legend_func = obj.figure.legend
+    elif isinstance(obj, mpl.axes.Axes):
+        old_legend = obj.legend_
+        legend_func = obj.legend
+    elif isinstance(obj, mpl.figure.Figure):
+        if obj.legends:
+            old_legend = obj.legends[-1]
+        else:
+            old_legend = None
+        legend_func = obj.legend
+    else:
+        err = "`obj` must be a seaborn Grid or matplotlib Axes or Figure instance."
+        raise TypeError(err)
+
+    if old_legend is None:
+        err = f"{obj} has no legend attached."
+        raise ValueError(err)
+
+    # Extract the components of the legend we need to reuse
+    # Import here to avoid a circular import
+    from seaborn._compat import get_legend_handles
+    handles = get_legend_handles(old_legend)
+    labels = [t.get_text() for t in old_legend.get_texts()]
+
+    # Handle the case where the user is trying to override the labels
+    if (new_labels := kwargs.pop("labels", None)) is not None:
+        if len(new_labels) != len(labels):
+            err = "Length of new labels does not match existing legend."
+            raise ValueError(err)
+        labels = new_labels
+
+    # Extract legend properties that can be passed to the recreation method
+    # (Vexingly, these don't all round-trip)
+    legend_kws = inspect.signature(mpl.legend.Legend).parameters
+    props = {k: v for k, v in old_legend.properties().items() if k in legend_kws}
+
+    # Delegate default bbox_to_anchor rules to matplotlib
+    props.pop("bbox_to_anchor")
+
+    # Try to propagate the existing title and font properties; respect new ones too
+    title = props.pop("title")
+    if "title" in kwargs:
+        title.set_text(kwargs.pop("title"))
+    title_kwargs = {k: v for k, v in kwargs.items() if k.startswith("title_")}
+    for key, val in title_kwargs.items():
+        title.set(**{key[6:]: val})
+        kwargs.pop(key)
+
+    # Try to respect the frame visibility
+    kwargs.setdefault("frameon", old_legend.legendPatch.get_visible())
+
+    # Remove the old legend and create the new one
+    props.update(kwargs)
+    old_legend.remove()
+    new_legend = legend_func(handles, labels, loc=loc, **props)
+    new_legend.set_title(title.get_text(), title.get_fontproperties())
+
+    # Let the Grid object continue to track the correct legend object
+    if isinstance(obj, Grid):
+        obj._legend = new_legend
+
+
 def _kde_support(data, bw, gridsize, cut, clip):
     """Establish support for a kernel density estimate."""
     support_min = max(data.min() - bw * cut, clip[0])
@@ -411,27 +496,25 @@ def get_dataset_names():
     Requires an internet connection.
 
     """
-    url = "https://github.com/mwaskom/seaborn-data"
-    with urlopen(url) as resp:
-        html = resp.read()
+    with urlopen(DATASET_NAMES_URL) as resp:
+        txt = resp.read()
 
-    pat = r"/mwaskom/seaborn-data/blob/master/(\w*).csv"
-    datasets = re.findall(pat, html.decode())
-    return datasets
+    dataset_names = [name.strip() for name in txt.decode().split("\n")]
+    return list(filter(None, dataset_names))
 
 
 def get_data_home(data_home=None):
     """Return a path to the cache directory for example datasets.
 
-    This directory is then used by :func:`load_dataset`.
+    This directory is used by :func:`load_dataset`.
 
-    If the ``data_home`` argument is not specified, it tries to read from the
-    ``SEABORN_DATA`` environment variable and defaults to ``~/seaborn-data``.
+    If the ``data_home`` argument is not provided, it will use a directory
+    specified by the `SEABORN_DATA` environment variable (if it exists)
+    or otherwise default to an OS-appropriate user cache location.
 
     """
     if data_home is None:
-        data_home = os.environ.get('SEABORN_DATA',
-                                   os.path.join('~', 'seaborn-data'))
+        data_home = os.environ.get("SEABORN_DATA", user_cache_dir("seaborn"))
     data_home = os.path.expanduser(data_home)
     if not os.path.exists(data_home):
         os.makedirs(data_home)
@@ -481,7 +564,7 @@ def load_dataset(name, cache=True, data_home=None, **kws):
         )
         raise TypeError(err)
 
-    url = f"https://raw.githubusercontent.com/mwaskom/seaborn-data/master/{name}.csv"
+    url = f"{DATASET_SOURCE}/{name}.csv"
 
     if cache:
         cache_path = os.path.join(get_data_home(data_home), os.path.basename(url))
@@ -506,23 +589,23 @@ def load_dataset(name, cache=True, data_home=None, **kws):
         df["time"] = pd.Categorical(df["time"], ["Lunch", "Dinner"])
         df["smoker"] = pd.Categorical(df["smoker"], ["Yes", "No"])
 
-    if name == "flights":
+    elif name == "flights":
         months = df["month"].str[:3]
         df["month"] = pd.Categorical(months, months.unique())
 
-    if name == "exercise":
+    elif name == "exercise":
         df["time"] = pd.Categorical(df["time"], ["1 min", "15 min", "30 min"])
         df["kind"] = pd.Categorical(df["kind"], ["rest", "walking", "running"])
         df["diet"] = pd.Categorical(df["diet"], ["no fat", "low fat"])
 
-    if name == "titanic":
+    elif name == "titanic":
         df["class"] = pd.Categorical(df["class"], ["First", "Second", "Third"])
         df["deck"] = pd.Categorical(df["deck"], list("ABCDEFG"))
 
-    if name == "penguins":
+    elif name == "penguins":
         df["sex"] = df["sex"].str.title()
 
-    if name == "diamonds":
+    elif name == "diamonds":
         df["color"] = pd.Categorical(
             df["color"], ["D", "E", "F", "G", "H", "I", "J"],
         )
@@ -532,6 +615,16 @@ def load_dataset(name, cache=True, data_home=None, **kws):
         df["cut"] = pd.Categorical(
             df["cut"], ["Ideal", "Premium", "Very Good", "Good", "Fair"],
         )
+
+    elif name == "taxis":
+        df["pickup"] = pd.to_datetime(df["pickup"])
+        df["dropoff"] = pd.to_datetime(df["dropoff"])
+
+    elif name == "seaice":
+        df["Date"] = pd.to_datetime(df["Date"])
+
+    elif name == "dowjones":
+        df["Date"] = pd.to_datetime(df["Date"])
 
     return df
 
@@ -592,13 +685,13 @@ def locator_to_legend_entries(locator, limits, dtype):
         formatter = mpl.ticker.LogFormatter()
     else:
         formatter = mpl.ticker.ScalarFormatter()
+        # Avoid having an offset/scientific notation which we don't currently
+        # have any way of representing in the legend
+        formatter.set_useOffset(False)
+        formatter.set_scientific(False)
     formatter.axis = dummy_axis()
 
-    # TODO: The following two lines should be replaced
-    # once pinned matplotlib>=3.1.0 with:
-    # formatted_levels = formatter.format_ticks(raw_levels)
-    formatter.set_locs(raw_levels)
-    formatted_levels = [formatter(x) for x in raw_levels]
+    formatted_levels = formatter.format_ticks(raw_levels)
 
     return raw_levels, formatted_levels
 
@@ -654,32 +747,18 @@ def to_utf8(obj):
         return str(obj)
 
 
-def _normalize_kwargs(kws, artist):
-    """Wrapper for mpl.cbook.normalize_kwargs that supports <= 3.2.1."""
-    _alias_map = {
-        'color': ['c'],
-        'linewidth': ['lw'],
-        'linestyle': ['ls'],
-        'facecolor': ['fc'],
-        'edgecolor': ['ec'],
-        'markerfacecolor': ['mfc'],
-        'markeredgecolor': ['mec'],
-        'markeredgewidth': ['mew'],
-        'markersize': ['ms']
-    }
-    try:
-        kws = normalize_kwargs(kws, artist)
-    except AttributeError:
-        kws = normalize_kwargs(kws, _alias_map)
-    return kws
-
-
-def _check_argument(param, options, value):
+def _check_argument(param, options, value, prefix=False):
     """Raise if value for param is not in options."""
-    if value not in options:
+    if prefix and value is not None:
+        failure = not any(value.startswith(p) for p in options if isinstance(p, str))
+    else:
+        failure = value not in options
+    if failure:
         raise ValueError(
-            f"`{param}` must be one of {options}, but {repr(value)} was passed."
+            f"The value for `{param}` must be one of {options}, "
+            f"but {repr(value)} was passed."
         )
+    return value
 
 
 def _assign_default_kwargs(kws, call_func, source_func):
@@ -687,7 +766,7 @@ def _assign_default_kwargs(kws, call_func, source_func):
     # This exists so that axes-level functions and figure-level functions can
     # both call a Plotter method while having the default kwargs be defined in
     # the signature of the axes-level function.
-    # An alternative would be to  have a decorator on the method that sets its
+    # An alternative would be to have a decorator on the method that sets its
     # defaults based on those defined in the axes-level function.
     # Then the figure-level function would not need to worry about defaults.
     # I am not sure which is better.
@@ -702,7 +781,12 @@ def _assign_default_kwargs(kws, call_func, source_func):
 
 
 def adjust_legend_subtitles(legend):
-    """Make invisible-handle "subtitles" entries look more like titles."""
+    """
+    Make invisible-handle "subtitles" entries look more like titles.
+
+    Note: This function is not part of the public API and may be changed or removed.
+
+    """
     # Legend title not in rcParams until 3.0
     font_size = plt.rcParams.get("legend.title_fontsize", None)
     hpackers = legend.findobj(mpl.offsetbox.VPacker)[0].get_children()
@@ -725,7 +809,7 @@ def _deprecate_ci(errorbar, ci):
     (and extracted from kwargs) after one cycle.
 
     """
-    if ci != "deprecated":
+    if ci is not deprecated and ci != "deprecated":
         if ci is None:
             errorbar = None
         elif ci == "sd":
@@ -733,9 +817,92 @@ def _deprecate_ci(errorbar, ci):
         else:
             errorbar = ("ci", ci)
         msg = (
-            "The `ci` parameter is deprecated; "
-            f"use `errorbar={repr(errorbar)}` for same effect."
+            "\n\nThe `ci` parameter is deprecated. "
+            f"Use `errorbar={repr(errorbar)}` for the same effect.\n"
         )
-        warnings.warn(msg, UserWarning)
+        warnings.warn(msg, FutureWarning, stacklevel=3)
 
     return errorbar
+
+
+def _get_transform_functions(ax, axis):
+    """Return the forward and inverse transforms for a given axis."""
+    axis_obj = getattr(ax, f"{axis}axis")
+    transform = axis_obj.get_transform()
+    return transform.transform, transform.inverted().transform
+
+
+@contextmanager
+def _disable_autolayout():
+    """Context manager for preventing rc-controlled auto-layout behavior."""
+    # This is a workaround for an issue in matplotlib, for details see
+    # https://github.com/mwaskom/seaborn/issues/2914
+    # The only affect of this rcParam is to set the default value for
+    # layout= in plt.figure, so we could just do that instead.
+    # But then we would need to own the complexity of the transition
+    # from tight_layout=True -> layout="tight". This seems easier,
+    # but can be removed when (if) that is simpler on the matplotlib side,
+    # or if the layout algorithms are improved to handle figure legends.
+    orig_val = mpl.rcParams["figure.autolayout"]
+    try:
+        mpl.rcParams["figure.autolayout"] = False
+        yield
+    finally:
+        mpl.rcParams["figure.autolayout"] = orig_val
+
+
+def _version_predates(lib: ModuleType, version: str) -> bool:
+    """Helper function for checking version compatibility."""
+    return Version(lib.__version__) < Version(version)
+
+
+def _scatter_legend_artist(**kws):
+
+    kws = normalize_kwargs(kws, mpl.collections.PathCollection)
+
+    edgecolor = kws.pop("edgecolor", None)
+    rc = mpl.rcParams
+    marker = kws.pop("marker", "o")
+
+    markeredgewidth = kws.pop("linewidth", None)
+    if markeredgewidth is None:
+        # Unfilled markers (e.g. "x", "+") are drawn using only their edge,
+        # so a zero edge width would make them invisible in the legend.
+        if mpl.markers.MarkerStyle(marker).is_filled():
+            markeredgewidth = 0
+        else:
+            markeredgewidth = rc["lines.markeredgewidth"]
+
+    line_kws = {
+        "linestyle": "",
+        "marker": marker,
+        "markersize": np.sqrt(kws.pop("s", rc["lines.markersize"] ** 2)),
+        "markerfacecolor": kws.pop("facecolor", kws.get("color")),
+        "markeredgewidth": markeredgewidth,
+        **kws,
+    }
+
+    if edgecolor is not None:
+        if edgecolor == "face":
+            line_kws["markeredgecolor"] = line_kws["markerfacecolor"]
+        else:
+            line_kws["markeredgecolor"] = edgecolor
+
+    return mpl.lines.Line2D([], [], **line_kws)
+
+
+def _get_patch_legend_artist(fill):
+
+    def legend_artist(**kws):
+
+        color = kws.pop("color", None)
+        if color is not None:
+            if fill:
+                kws["facecolor"] = color
+            else:
+                kws["edgecolor"] = color
+                kws["facecolor"] = "none"
+
+        return mpl.patches.Rectangle((0, 0), 0, 0, **kws)
+
+    return legend_artist
